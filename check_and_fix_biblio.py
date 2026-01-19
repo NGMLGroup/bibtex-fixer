@@ -223,11 +223,383 @@ def format_entry(entry_type, key, fields):
 
 
 def is_arxiv_entry(fields):
-    for field in ("journal", "eprint", "archiveprefix", "url"):
+    for field in ("journal", "eprint", "archiveprefix", "url", "note", "doi"):
         value = fields.get(field, "")
         if "arxiv" in value.lower():
             return True
     return False
+
+
+def extract_doi(fields):
+    for field in ("doi", "url"):
+        value = fields.get(field)
+        if not value:
+            continue
+        value = value.strip()
+        if not value:
+            continue
+        lower_value = value.lower()
+        if "doi.org/" in lower_value:
+            doi = value.split("doi.org/", 1)[1].strip()
+            if doi:
+                return doi.rstrip(".")
+        match = re.search(r"(10\.\d{4,9}/[^\s{}<>]+)", value, re.IGNORECASE)
+        if match:
+            return match.group(1).rstrip(".")
+    return None
+
+
+def remove_arxiv_fields(fields):
+    cleaned = dict(fields)
+    for field in ("eprint", "archiveprefix", "primaryclass"):
+        cleaned.pop(field, None)
+    for field in ("journal", "url", "note"):
+        value = cleaned.get(field)
+        if value and "arxiv" in value.lower():
+            cleaned.pop(field, None)
+    return cleaned
+
+
+def crossref_item_is_preprint(item):
+    item_type = (item.get("type") or "").lower()
+    if item_type in ("posted-content", "preprint"):
+        return True
+    container = (item.get("container-title") or [None])[0] or ""
+    if "arxiv" in container.lower():
+        return True
+    url = item.get("URL") or ""
+    if "arxiv" in url.lower():
+        return True
+    return False
+
+
+def openalex_item_is_preprint(item):
+    item_type = (item.get("type") or "").lower()
+    if item_type == "preprint":
+        return True
+    host = item.get("host_venue") or {}
+    venue = host.get("display_name") or ""
+    return "arxiv" in venue.lower()
+
+
+def semantic_scholar_item_is_preprint(item):
+    journal_name = (item.get("journal") or {}).get("name") or ""
+    venue = item.get("venue") or ""
+    publication_venue = (item.get("publicationVenue") or {}).get("name") or ""
+    if (
+        "arxiv" in journal_name.lower()
+        or "arxiv" in venue.lower()
+        or "arxiv" in publication_venue.lower()
+    ):
+        return True
+    types = item.get("publicationTypes") or []
+    if any(entry_type.lower() == "preprint" for entry_type in types):
+        return True
+    external_ids = item.get("externalIds") or {}
+    arxiv_id = external_ids.get("ArXiv") or external_ids.get("arXiv")
+    if arxiv_id and not (journal_name or venue or publication_venue):
+        return True
+    return False
+
+
+def first_author_for_paperhash(author_field):
+    if not author_field:
+        return None
+    first_author = author_field.split(" and ", 1)[0].strip()
+    if not first_author:
+        return None
+    if "," in first_author:
+        parts = [part.strip() for part in first_author.split(",", 1)]
+        if len(parts) == 2 and parts[1]:
+            first_author = f"{parts[1]} {parts[0]}"
+        else:
+            first_author = first_author.replace(",", " ")
+    return clean_whitespace(first_author)
+
+
+def author_looks_incomplete(author_field):
+    if not author_field:
+        return True
+    author_lower = author_field.lower()
+    if "et al" in author_lower:
+        return True
+    return False
+
+
+def get_paperhash(first_author, title):
+    title = title.strip()
+    strip_punctuation = r"[^A-Za-z\d\s]"
+    title = re.sub(strip_punctuation, "", title)
+    first_author = re.sub(strip_punctuation, "", first_author)
+    first_author = first_author.split(" ").pop()
+    title = re.sub(strip_punctuation, "", title)
+    title = re.sub(r"\r|\n", "", title)
+    title = re.sub(r"\s+", "_", title)
+    first_author = re.sub(strip_punctuation, "", first_author)
+    return (first_author + "|" + title).lower()
+
+
+def openreview_value(value):
+    if isinstance(value, dict) and "value" in value:
+        return value["value"]
+    return value
+
+
+def openreview_item_title(item):
+    content = item.get("content") or {}
+    forum_content = item.get("forumContent") or {}
+    return openreview_value(content.get("title")) or openreview_value(
+        forum_content.get("title")
+    )
+
+
+def openreview_item_priority(item):
+    invitations = item.get("invitations") or item.get("invitation") or []
+    if isinstance(invitations, str):
+        invitations = [invitations]
+    content = item.get("content") or {}
+    venueid = openreview_value(content.get("venueid")) or ""
+    for invitation in invitations:
+        invitation_lower = invitation.lower()
+        if (
+            "/-/submission" in invitation_lower
+            or "/-/camera_ready" in invitation_lower
+            or "/-/paper" in invitation_lower
+        ):
+            return 3
+        if ".cc/" in invitation or "openreview.net" in invitation:
+            return 2
+    if ".cc/" in venueid:
+        return 1
+    return 0
+
+
+def openreview_item_is_preprint(item):
+    content = item.get("content") or {}
+    forum_content = item.get("forumContent") or {}
+    venue = openreview_value(content.get("venue")) or openreview_value(
+        forum_content.get("venue")
+    )
+    venueid = openreview_value(content.get("venueid")) or openreview_value(
+        forum_content.get("venueid")
+    )
+    for value in (venue, venueid):
+        if value and any(token in value.lower() for token in ("arxiv", "corr")):
+            return True
+    return False
+
+
+def extract_year_from_text(value):
+    if not value:
+        return None
+    match = re.search(r"(19|20)\d{2}", value)
+    if match:
+        return int(match.group(0))
+    return None
+
+
+def ordinal_word(number):
+    ones = {
+        1: "First",
+        2: "Second",
+        3: "Third",
+        4: "Fourth",
+        5: "Fifth",
+        6: "Sixth",
+        7: "Seventh",
+        8: "Eighth",
+        9: "Ninth",
+        10: "Tenth",
+        11: "Eleventh",
+        12: "Twelfth",
+        13: "Thirteenth",
+        14: "Fourteenth",
+        15: "Fifteenth",
+        16: "Sixteenth",
+        17: "Seventeenth",
+        18: "Eighteenth",
+        19: "Nineteenth",
+    }
+    tens_ordinal = {
+        20: "Twentieth",
+        30: "Thirtieth",
+        40: "Fortieth",
+        50: "Fiftieth",
+        60: "Sixtieth",
+        70: "Seventieth",
+        80: "Eightieth",
+        90: "Ninetieth",
+    }
+    tens_cardinal = {
+        2: "Twenty",
+        3: "Thirty",
+        4: "Forty",
+        5: "Fifty",
+        6: "Sixty",
+        7: "Seventy",
+        8: "Eighty",
+        9: "Ninety",
+    }
+    if number in ones:
+        return ones[number]
+    if number in tens_ordinal:
+        return tens_ordinal[number]
+    if 20 < number < 100:
+        tens, ones_digit = divmod(number, 10)
+        tens_word = tens_cardinal.get(tens)
+        ones_word = ones.get(ones_digit)
+        if tens_word and ones_word:
+            return f"{tens_word}-{ones_word.lower()}"
+    return None
+
+
+def iclr_booktitle(year):
+    if not year:
+        return "International Conference on Learning Representations"
+    ordinal = year - 2012
+    word = ordinal_word(ordinal)
+    if word:
+        return f"The {word} International Conference on Learning Representations"
+    return f"The {ordinal}th International Conference on Learning Representations"
+
+
+def icml_booktitle(year):
+    if not year:
+        return "International Conference on Machine Learning"
+    ordinal = year - 1983
+    word = ordinal_word(ordinal)
+    if word:
+        return f"{word} International Conference on Machine Learning"
+    return f"{ordinal}th International Conference on Machine Learning"
+
+
+def neurips_booktitle(year):
+    if not year:
+        return "Conference on Neural Information Processing Systems"
+    ordinal = year - 1986
+    word = ordinal_word(ordinal)
+    if word:
+        return f"{word} Conference on Neural Information Processing Systems"
+    return f"{ordinal}th Conference on Neural Information Processing Systems"
+
+
+def openreview_venue_to_booktitle(venue):
+    if not venue:
+        return None
+    venue = clean_whitespace(str(venue))
+    venue_lower = venue.lower()
+    for suffix in (" poster", " spotlight", " oral"):
+        if venue_lower.endswith(suffix):
+            venue = venue[: -len(suffix)]
+            venue_lower = venue.lower()
+            break
+    venue_lower = venue.lower()
+    if "iclr" in venue_lower or "iclr.cc" in venue_lower:
+        year = extract_year_from_text(venue)
+        return iclr_booktitle(year)
+    if "icml" in venue_lower or "icml.cc" in venue_lower:
+        year = extract_year_from_text(venue)
+        return icml_booktitle(year)
+    if "neurips" in venue_lower or "nips" in venue_lower:
+        year = extract_year_from_text(venue)
+        return neurips_booktitle(year)
+    return venue
+
+
+def openreview_date_to_year(value):
+    if value is None:
+        return None
+    try:
+        timestamp = int(value) / 1000
+    except (ValueError, TypeError):
+        return None
+    return time.gmtime(timestamp).tm_year
+
+
+def search_openreview_paperhash(title, author_field, rows=5):
+    first_author = first_author_for_paperhash(author_field)
+    if not title or not first_author:
+        return []
+    paperhash = get_paperhash(first_author, title)
+    params = {"paperhash": paperhash, "limit": rows}
+    url = "https://api2.openreview.net/notes?" + urllib.parse.urlencode(params)
+    headers = {"User-Agent": "check_and_fix_biblio/0.1"}
+    data = json.loads(http_get(url, headers=headers).decode("utf-8"))
+    return data.get("notes", [])
+
+
+def search_openreview_by_title(title, rows=10):
+    if not title:
+        return []
+    params = {"term": title, "limit": rows}
+    url = "https://api2.openreview.net/notes/search?" + urllib.parse.urlencode(params)
+    headers = {"User-Agent": "check_and_fix_biblio/0.1"}
+    data = json.loads(http_get(url, headers=headers).decode("utf-8"))
+    return data.get("notes", [])
+
+
+def search_openreview(title, author_field, rows=5):
+    candidates = []
+    if not author_looks_incomplete(author_field):
+        candidates = search_openreview_paperhash(title, author_field, rows=rows)
+    if candidates:
+        return candidates
+    return search_openreview_by_title(title, rows=max(10, rows))
+
+
+def find_best_openreview_match(title, candidates, min_similarity, skip_predicate=None):
+    best_item = None
+    best_score = 0.0
+    best_priority = -1
+    for item in candidates:
+        if skip_predicate and skip_predicate(item):
+            continue
+        candidate_title = openreview_item_title(item)
+        if not candidate_title:
+            continue
+        score = title_similarity(title, candidate_title)
+        if score < min_similarity:
+            continue
+        priority = openreview_item_priority(item)
+        if score > best_score or (score == best_score and priority > best_priority):
+            best_item = item
+            best_score = score
+            best_priority = priority
+    return best_item, best_score
+
+
+def openreview_item_to_fields(item):
+    fields = {}
+    content = item.get("content") or {}
+    forum_content = item.get("forumContent") or {}
+
+    def get_field(name):
+        return openreview_value(content.get(name)) or openreview_value(
+            forum_content.get(name)
+        )
+
+    title = get_field("title")
+    if title:
+        fields["title"] = title
+    authors = get_field("authors")
+    if authors:
+        fields["author"] = " and ".join(authors)
+    year = get_field("year")
+    if not year:
+        year = openreview_date_to_year(item.get("pdate") or item.get("cdate"))
+    if year:
+        fields["year"] = str(year)
+    venue = get_field("venue")
+    venueid = get_field("venueid")
+    booktitle = openreview_venue_to_booktitle(venue) or openreview_venue_to_booktitle(
+        venueid
+    )
+    if booktitle:
+        fields["booktitle"] = booktitle
+    forum_id = item.get("forum") or item.get("id")
+    if forum_id:
+        fields["url"] = f"https://openreview.net/forum?id={forum_id}"
+    return fields
 
 
 def search_crossref(title, rows=5, mailto=None):
@@ -539,13 +911,18 @@ def detect_changes(existing, updated):
     for field, value in updated.items():
         if normalize_value(existing.get(field, "")) != normalize_value(value):
             changed.append(field)
+    for field in existing.keys():
+        if field not in updated:
+            changed.append(field)
     return sorted(set(changed))
 
 
-def find_best_match_by_title(title, candidates, min_similarity):
+def find_best_match_by_title(title, candidates, min_similarity, skip_predicate=None):
     best_item = None
     best_score = 0.0
     for item in candidates:
+        if skip_predicate and skip_predicate(item):
+            continue
         candidate_title = item.get("title")
         if isinstance(candidate_title, list):
             candidate_title = candidate_title[0] if candidate_title else None
@@ -573,28 +950,71 @@ def process_entry(
     openalex_rows,
     semantic_scholar_rows,
 ):
-    title = fields.get("title")
-    if not title:
-        return None, "missing title"
-    if is_arxiv_entry(fields):
-        try:
-            candidates = search_arxiv(title, max_results=5)
-        except Exception as exc:
-            return None, f"arXiv lookup failed: {exc}"
-        best, score = find_best_match_by_title(title, candidates, min_similarity)
-        if not best:
-            return None, f"no arXiv match (best score {score:.2f})"
-        candidate_fields = arxiv_entry_to_fields(best)
-        candidate_fields = sanitize_fields(candidate_fields)
-        candidate_type = entry_type or "article"
-        time.sleep(delay)
-        return (candidate_type, candidate_fields), None
     errors = []
     scores = {}
+    entry_is_arxiv = is_arxiv_entry(fields)
+    doi_fallback = None
+    doi = extract_doi(fields)
+    if doi:
+        try:
+            bibtex = fetch_crossref_bibtex(doi, mailto=mailto)
+            parsed_type, _, parsed_fields = parse_entry(bibtex)
+            candidate_type = parsed_type or entry_type or "article"
+            candidate_fields = sanitize_fields(parsed_fields)
+            candidate_is_arxiv = is_arxiv_entry(candidate_fields)
+            if not entry_is_arxiv or not candidate_is_arxiv:
+                time.sleep(delay)
+                return (candidate_type, candidate_fields, candidate_is_arxiv), None
+            doi_fallback = (candidate_type, candidate_fields, candidate_is_arxiv)
+        except Exception as exc:
+            errors.append(f"Crossref DOI lookup failed: {exc}")
+        time.sleep(delay)
+
+    title = fields.get("title")
+    if not title:
+        if doi_fallback:
+            return doi_fallback, None
+        if errors:
+            return None, f"missing title; {'; '.join(errors)}"
+        return None, "missing title"
+
+    should_try_openreview = (
+        entry_is_arxiv
+        or not (fields.get("booktitle") or fields.get("journal"))
+        or not (fields.get("url") or fields.get("doi"))
+        or author_looks_incomplete(fields.get("author"))
+    )
+    if should_try_openreview:
+        try:
+            items = search_openreview(title, fields.get("author"), rows=10)
+            best_item, score = find_best_openreview_match(
+                title,
+                items,
+                min_similarity,
+                skip_predicate=openreview_item_is_preprint if entry_is_arxiv else None,
+            )
+            scores["OpenReview"] = score
+            if best_item:
+                candidate_fields = openreview_item_to_fields(best_item)
+                candidate_fields = sanitize_fields(candidate_fields)
+                candidate_type = entry_type or "article"
+                if "booktitle" in candidate_fields:
+                    candidate_type = "inproceedings"
+                candidate_is_arxiv = is_arxiv_entry(candidate_fields)
+                time.sleep(delay)
+                return (candidate_type, candidate_fields, candidate_is_arxiv), None
+        except Exception as exc:
+            errors.append(f"OpenReview lookup failed: {exc}")
+        time.sleep(delay)
 
     try:
         items = search_crossref(title, rows=crossref_rows, mailto=mailto)
-        best_item, score = find_best_match_by_title(title, items, min_similarity)
+        best_item, score = find_best_match_by_title(
+            title,
+            items,
+            min_similarity,
+            skip_predicate=crossref_item_is_preprint if entry_is_arxiv else None,
+        )
         scores["Crossref"] = score
         if best_item:
             candidate_type = crossref_type_to_bibtex(best_item.get("type"), entry_type)
@@ -611,39 +1031,82 @@ def process_entry(
             else:
                 candidate_fields = crossref_item_to_fields(best_item, candidate_type)
             candidate_fields = sanitize_fields(candidate_fields)
-            time.sleep(delay)
-            return (candidate_type, candidate_fields), None
+            candidate_is_arxiv = is_arxiv_entry(candidate_fields)
+            if not (entry_is_arxiv and candidate_is_arxiv):
+                time.sleep(delay)
+                return (candidate_type, candidate_fields, candidate_is_arxiv), None
     except Exception as exc:
         errors.append(f"Crossref lookup failed: {exc}")
     time.sleep(delay)
 
     try:
         items = search_openalex(title, rows=openalex_rows, mailto=mailto)
-        best_item, score = find_best_match_by_title(title, items, min_similarity)
+        best_item, score = find_best_match_by_title(
+            title,
+            items,
+            min_similarity,
+            skip_predicate=openalex_item_is_preprint if entry_is_arxiv else None,
+        )
         scores["OpenAlex"] = score
         if best_item:
             candidate_type = openalex_type_to_bibtex(best_item.get("type"), entry_type)
             candidate_fields = openalex_item_to_fields(best_item, candidate_type)
             candidate_fields = sanitize_fields(candidate_fields)
-            time.sleep(delay)
-            return (candidate_type, candidate_fields), None
+            candidate_is_arxiv = is_arxiv_entry(candidate_fields)
+            if not (entry_is_arxiv and candidate_is_arxiv):
+                time.sleep(delay)
+                return (candidate_type, candidate_fields, candidate_is_arxiv), None
     except Exception as exc:
         errors.append(f"OpenAlex lookup failed: {exc}")
     time.sleep(delay)
 
     try:
         items = search_semantic_scholar(title, rows=semantic_scholar_rows)
-        best_item, score = find_best_match_by_title(title, items, min_similarity)
+        best_item, score = find_best_match_by_title(
+            title,
+            items,
+            min_similarity,
+            skip_predicate=semantic_scholar_item_is_preprint if entry_is_arxiv else None,
+        )
         scores["Semantic Scholar"] = score
         if best_item:
             candidate_type = semantic_scholar_type_to_bibtex(best_item, entry_type)
             candidate_fields = semantic_scholar_item_to_fields(best_item, candidate_type)
             candidate_fields = sanitize_fields(candidate_fields)
-            time.sleep(delay)
-            return (candidate_type, candidate_fields), None
+            candidate_is_arxiv = is_arxiv_entry(candidate_fields)
+            if not (entry_is_arxiv and candidate_is_arxiv):
+                time.sleep(delay)
+                return (candidate_type, candidate_fields, candidate_is_arxiv), None
     except Exception as exc:
         errors.append(f"Semantic Scholar lookup failed: {exc}")
     time.sleep(delay)
+
+    if entry_is_arxiv:
+        if doi_fallback:
+            return doi_fallback, None
+        try:
+            candidates = search_arxiv(title, max_results=5)
+        except Exception as exc:
+            errors.append(f"arXiv lookup failed: {exc}")
+            score_info = "; ".join(
+                f"{name} best score {score:.2f}" for name, score in scores.items()
+            )
+            if errors and score_info:
+                return None, f"no published match ({score_info}); {'; '.join(errors)}"
+            return None, "; ".join(errors)
+        best, score = find_best_match_by_title(title, candidates, min_similarity)
+        if not best:
+            score_info = "; ".join(
+                f"{name} best score {score:.2f}" for name, score in scores.items()
+            )
+            if score_info:
+                return None, f"no published match ({score_info}); no arXiv match (best score {score:.2f})"
+            return None, f"no arXiv match (best score {score:.2f})"
+        candidate_fields = arxiv_entry_to_fields(best)
+        candidate_fields = sanitize_fields(candidate_fields)
+        candidate_type = entry_type or "article"
+        time.sleep(delay)
+        return (candidate_type, candidate_fields, True), None
 
     score_info = "; ".join(
         f"{name} best score {score:.2f}" for name, score in scores.items()
@@ -761,13 +1224,16 @@ def main():
                 error.startswith("no match")
                 or error.startswith("no arXiv match")
                 or error.startswith("no Crossref match")
+                or error.startswith("no published match")
             ):
                 print("Result: Error: no similar matches found", flush=True)
             else:
                 print(f"Result: Error: {error}", flush=True)
             continue
-        candidate_type, candidate_fields = candidate
+        candidate_type, candidate_fields, candidate_is_arxiv = candidate
         merged_fields = merge_fields(fields, candidate_fields)
+        if is_arxiv_entry(fields) and not candidate_is_arxiv:
+            merged_fields = remove_arxiv_fields(merged_fields)
         merged_fields = sanitize_fields(merged_fields)
         changed_fields = detect_changes(fields, merged_fields)
         if candidate_type != entry_type:
