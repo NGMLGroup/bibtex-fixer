@@ -13,11 +13,6 @@ normalized BibTeX file.
 - Merges fetched metadata into the existing fields.
 - Writes a normalized BibTeX file with a consistent field order.
 
-## Requirements
-
-- Python 3.8+ (stdlib only; no external dependencies)
-- Network access (Crossref, OpenAlex, Semantic Scholar, OpenReview, arXiv)
-
 ## Usage
 
 Basic usage:
@@ -26,7 +21,7 @@ Basic usage:
 python check_and_fix_biblio.py  --input biblio.bib  --output biblio_fixed.bib
 ```
 
-Common options:
+Main options:
 
 - `--mailto`: Email address to include in the Crossref User-Agent header.
 - `--min-similarity`: Minimum title similarity (0-1) required to accept a match.
@@ -47,15 +42,9 @@ python check_and_fix_biblio.py \
   --delay 1.0
 ```
 
-## Output
+## Notes
 
-The script prints a per-entry status and a summary of how many entries were
-updated, unchanged, unresolved, or had errors. The output file is rewritten
-with a consistent field order and ASCII-only content.
-
-## Notes and limitations
-
-- Matching is title-based; author/year are not used for disambiguation.
+- Matching is **title-based**; author/year are not used for disambiguation.
 - Entries are reformatted; original comments and non-entry content are not
   preserved.
 - Output is ASCII-only; non-ASCII characters are stripped.
