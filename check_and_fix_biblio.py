@@ -1,20 +1,123 @@
 #!/usr/bin/env python3
+
+"""
+Usage:
+
+python check_and_fix_biblio.py \
+  --input project_description/biblio.bib \
+  --output project_description/biblio_checked.bib
+
+python check_and_fix_biblio.py \
+  --input project_description/biblio.bib \
+  --output project_description/biblio_checked_retry.bib \
+  --retry-unresolved unresolved-bib-entries.bib \
+  --http-timeout 60
+"""
 import argparse
 import json
+import os
 import re
+import socket
 import sys
 import time
 import unicodedata
+import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from difflib import SequenceMatcher
 
 
-def http_get(url, headers=None, timeout=30):
-    request = urllib.request.Request(url, headers=headers or {})
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return response.read()
+DEFAULT_HTTP_TIMEOUT = 30
+DEFAULT_HTTP_RETRIES = 4
+DEFAULT_HTTP_RETRY_BACKOFF = 3.0
+HOST_MIN_INTERVALS = {
+    "export.arxiv.org": 3.0,
+    "api.semanticscholar.org": 1.0,
+}
+LAST_REQUEST_TIMES = {}
+RETRYABLE_HTTP_STATUS_CODES = {429, 500, 502, 503, 504}
+ARXIV_ID_PATTERN = re.compile(
+    r"(?P<id>(?:[a-z\-]+(?:\.[A-Z]{2})?/\d{7}|\d{4}\.\d{4,5})(?:v\d+)?)",
+    re.IGNORECASE,
+)
+
+
+def http_get(url, headers=None, timeout=None):
+    effective_timeout = DEFAULT_HTTP_TIMEOUT if timeout is None else timeout
+    last_error = None
+    for attempt in range(DEFAULT_HTTP_RETRIES + 1):
+        throttle_request(url)
+        request = urllib.request.Request(url, headers=headers or {})
+        try:
+            with urllib.request.urlopen(request, timeout=effective_timeout) as response:
+                return response.read()
+        except urllib.error.HTTPError as exc:
+            last_error = exc
+            if attempt >= DEFAULT_HTTP_RETRIES or not is_retryable_http_error(exc):
+                raise
+            time.sleep(get_retry_delay(exc, attempt))
+        except (urllib.error.URLError, TimeoutError, socket.timeout) as exc:
+            last_error = exc
+            if attempt >= DEFAULT_HTTP_RETRIES or not is_retryable_network_error(exc):
+                raise
+            time.sleep(DEFAULT_HTTP_RETRY_BACKOFF * (2**attempt))
+    raise last_error
+
+
+def throttle_request(url):
+    host = urllib.parse.urlparse(url).netloc.lower()
+    min_interval = HOST_MIN_INTERVALS.get(host, 0.0)
+    if min_interval <= 0:
+        return
+    now = time.monotonic()
+    last_request = LAST_REQUEST_TIMES.get(host)
+    if last_request is not None:
+        remaining = min_interval - (now - last_request)
+        if remaining > 0:
+            time.sleep(remaining)
+    LAST_REQUEST_TIMES[host] = time.monotonic()
+
+
+def is_retryable_http_error(exc):
+    return getattr(exc, "code", None) in RETRYABLE_HTTP_STATUS_CODES
+
+
+def is_retryable_network_error(exc):
+    if isinstance(exc, (TimeoutError, socket.timeout)):
+        return True
+    if isinstance(exc, urllib.error.URLError):
+        reason = exc.reason
+        if isinstance(reason, (TimeoutError, socket.timeout)):
+            return True
+        reason_text = str(reason).lower()
+        return any(
+            fragment in reason_text
+            for fragment in (
+                "timed out",
+                "temporary failure",
+                "temporarily unavailable",
+                "connection reset",
+                "connection refused",
+            )
+        )
+    return False
+
+
+def is_transient_lookup_exception(exc):
+    return is_retryable_http_error(exc) or is_retryable_network_error(exc)
+
+
+def get_retry_delay(exc, attempt):
+    retry_after = None
+    if getattr(exc, "headers", None) is not None:
+        retry_after = exc.headers.get("Retry-After")
+    if retry_after:
+        try:
+            return max(float(retry_after), 0.0)
+        except (TypeError, ValueError):
+            pass
+    return DEFAULT_HTTP_RETRY_BACKOFF * (2**attempt)
 
 
 def clean_whitespace(value):
@@ -97,6 +200,12 @@ def split_entries(text):
         else:
             break
     return entries
+
+
+def load_bib_entries(path):
+    with open(path, "r", encoding="utf-8") as handle:
+        content = handle.read()
+    return split_entries(content)
 
 
 def split_top_level(text):
@@ -235,7 +344,7 @@ def extract_doi(fields):
         value = fields.get(field)
         if not value:
             continue
-        value = value.strip()
+        value = clean_whitespace(value)
         if not value:
             continue
         lower_value = value.lower()
@@ -249,11 +358,30 @@ def extract_doi(fields):
     return None
 
 
+def extract_arxiv_id(fields):
+    eprint = clean_whitespace(fields.get("eprint", ""))
+    if eprint and ARXIV_ID_PATTERN.fullmatch(eprint):
+        return eprint
+    for field in ("url", "journal", "note"):
+        value = fields.get(field, "")
+        if not value:
+            continue
+        match = re.search(r"arxiv:(?P<id>[^\s,;{}]+)", value, re.IGNORECASE)
+        if match:
+            return match.group("id")
+        match = re.search(
+            r"arxiv\.org/(?:abs|pdf)/(?P<id>[^?\s#/]+)", value, re.IGNORECASE
+        )
+        if match:
+            return match.group("id").removesuffix(".pdf")
+    return None
+
+
 def remove_arxiv_fields(fields):
     cleaned = dict(fields)
     for field in ("eprint", "archiveprefix", "primaryclass"):
         cleaned.pop(field, None)
-    for field in ("journal", "url", "note"):
+    for field in ("journal", "url", "note", "doi"):
         value = cleaned.get(field)
         if value and "arxiv" in value.lower():
             cleaned.pop(field, None)
@@ -602,6 +730,11 @@ def openreview_item_to_fields(item):
     return fields
 
 
+def has_core_metadata(fields):
+    required_fields = ("title", "author", "year")
+    return all(clean_whitespace(fields.get(field, "")) for field in required_fields)
+
+
 def search_crossref(title, rows=5, mailto=None):
     params = {"query.title": title, "rows": rows}
     url = "https://api.crossref.org/works?" + urllib.parse.urlencode(params)
@@ -825,11 +958,7 @@ def crossref_type_to_bibtex(entry_type, fallback):
     return mapping.get(entry_type, fallback or "article")
 
 
-def search_arxiv(title, max_results=5):
-    query = f'ti:"{title}"'
-    params = {"search_query": query, "start": 0, "max_results": max_results}
-    url = "http://export.arxiv.org/api/query?" + urllib.parse.urlencode(params)
-    xml_data = http_get(url).decode("utf-8")
+def parse_arxiv_feed(xml_data):
     root = ET.fromstring(xml_data)
     ns = {
         "atom": "http://www.w3.org/2005/Atom",
@@ -864,6 +993,22 @@ def search_arxiv(title, max_results=5):
             }
         )
     return results
+
+
+def query_arxiv(params):
+    url = "http://export.arxiv.org/api/query?" + urllib.parse.urlencode(params)
+    xml_data = http_get(url).decode("utf-8")
+    return parse_arxiv_feed(xml_data)
+
+
+def search_arxiv(title, max_results=5):
+    query = f'ti:"{title}"'
+    params = {"search_query": query, "start": 0, "max_results": max_results}
+    return query_arxiv(params)
+
+
+def fetch_arxiv_by_id(arxiv_id):
+    return query_arxiv({"id_list": arxiv_id})
 
 
 def arxiv_entry_to_fields(item):
@@ -939,6 +1084,16 @@ def find_best_match_by_title(title, candidates, min_similarity, skip_predicate=N
     return None, best_score
 
 
+def resolve_entry_from_doi(doi, entry_type, mailto):
+    bibtex = fetch_crossref_bibtex(doi, mailto=mailto)
+    parsed_type, _, parsed_fields = parse_entry(bibtex)
+    candidate_type = parsed_type or entry_type or "article"
+    candidate_fields = sanitize_fields(parsed_fields)
+    if not candidate_fields:
+        raise ValueError(f"Crossref returned empty BibTeX for DOI {doi}")
+    return candidate_type, candidate_fields
+
+
 def process_entry(
     entry_type,
     key,
@@ -954,13 +1109,13 @@ def process_entry(
     scores = {}
     entry_is_arxiv = is_arxiv_entry(fields)
     doi_fallback = None
+
     doi = extract_doi(fields)
     if doi:
         try:
-            bibtex = fetch_crossref_bibtex(doi, mailto=mailto)
-            parsed_type, _, parsed_fields = parse_entry(bibtex)
-            candidate_type = parsed_type or entry_type or "article"
-            candidate_fields = sanitize_fields(parsed_fields)
+            candidate_type, candidate_fields = resolve_entry_from_doi(
+                doi, entry_type, mailto
+            )
             candidate_is_arxiv = is_arxiv_entry(candidate_fields)
             if not entry_is_arxiv or not candidate_is_arxiv:
                 time.sleep(delay)
@@ -981,7 +1136,7 @@ def process_entry(
     should_try_openreview = (
         entry_is_arxiv
         or not (fields.get("booktitle") or fields.get("journal"))
-        or not (fields.get("url") or fields.get("doi"))
+        or not (fields.get("url") or extract_doi(fields))
         or author_looks_incomplete(fields.get("author"))
     )
     if should_try_openreview:
@@ -1084,9 +1239,29 @@ def process_entry(
     if entry_is_arxiv:
         if doi_fallback:
             return doi_fallback, None
+        arxiv_id = extract_arxiv_id(fields)
+        if arxiv_id:
+            try:
+                candidates = fetch_arxiv_by_id(arxiv_id)
+                if candidates:
+                    candidate_fields = arxiv_entry_to_fields(candidates[0])
+                    candidate_fields = sanitize_fields(candidate_fields)
+                    candidate_type = entry_type or "article"
+                    time.sleep(delay)
+                    return (candidate_type, candidate_fields, True), None
+                errors.append(f"no arXiv record for id {arxiv_id}")
+            except Exception as exc:
+                if has_core_metadata(fields) and is_transient_lookup_exception(exc):
+                    time.sleep(delay)
+                    return ((entry_type or "article"), sanitize_fields(fields), True), None
+                errors.append(f"arXiv lookup failed: {exc}")
+            time.sleep(delay)
         try:
             candidates = search_arxiv(title, max_results=5)
         except Exception as exc:
+            if has_core_metadata(fields) and is_transient_lookup_exception(exc):
+                time.sleep(delay)
+                return ((entry_type or "article"), sanitize_fields(fields), True), None
             errors.append(f"arXiv lookup failed: {exc}")
             score_info = "; ".join(
                 f"{name} best score {score:.2f}" for name, score in scores.items()
@@ -1100,7 +1275,10 @@ def process_entry(
                 f"{name} best score {score:.2f}" for name, score in scores.items()
             )
             if score_info:
-                return None, f"no published match ({score_info}); no arXiv match (best score {score:.2f})"
+                return None, (
+                    f"no published match ({score_info}); "
+                    f"no arXiv match (best score {score:.2f})"
+                )
             return None, f"no arXiv match (best score {score:.2f})"
         candidate_fields = arxiv_entry_to_fields(best)
         candidate_fields = sanitize_fields(candidate_fields)
@@ -1118,6 +1296,85 @@ def process_entry(
     return None, f"no match ({score_info})"
 
 
+def load_retry_targets(path):
+    retry_targets = {}
+    load_errors = []
+    for idx, entry_text in enumerate(load_bib_entries(path)):
+        entry_type, key, _ = parse_entry(entry_text)
+        if not key:
+            load_errors.append(
+                (
+                    None,
+                    f"could not parse entry key in retry file {path} at entry {idx + 1}",
+                )
+            )
+            continue
+        if key in retry_targets:
+            load_errors.append((key, f"duplicate key in retry file {path}"))
+            continue
+        retry_targets[key] = {
+            "entry_text": entry_text,
+            "entry_type": entry_type,
+        }
+    return retry_targets, load_errors
+
+
+def build_unresolved_record(key, entry_type, fields, reason, entry_text):
+    return {
+        "key": key,
+        "entry_type": entry_type,
+        "title": fields.get("title") if fields else None,
+        "reason": reason,
+        "entry_text": entry_text,
+    }
+
+
+def write_unresolved_outputs(
+    unresolved_output_path,
+    unresolved_log_path,
+    unresolved_records,
+    input_path,
+    checked_entries,
+    retry_source=None,
+):
+    unresolved_text = ""
+    if unresolved_records:
+        unresolved_text = "\n\n".join(
+            record["entry_text"] for record in unresolved_records
+        ).strip()
+        if unresolved_text:
+            unresolved_text += "\n"
+    with open(unresolved_output_path, "w", encoding="utf-8") as handle:
+        handle.write(unresolved_text)
+
+    lines = [
+        "Unresolved bibliography entries",
+        f"Generated: {time.strftime('%Y-%m-%d %H:%M:%S %Z')}",
+        f"Input: {input_path}",
+        f"Checked entries: {checked_entries}",
+        f"Remaining unresolved: {len(unresolved_records)}",
+        f"Retry file: {unresolved_output_path}",
+    ]
+    if retry_source:
+        lines.append(f"Retried from: {retry_source}")
+    lines.append("")
+    if not unresolved_records:
+        lines.append("No unresolved entries.")
+    else:
+        for idx, record in enumerate(unresolved_records, start=1):
+            lines.append(f"[{idx}] {record['key']}")
+            if record.get("title"):
+                lines.append(f"Title: {record['title']}")
+            if record.get("entry_type"):
+                lines.append(f"Entry type: {record['entry_type']}")
+            lines.append(f"Reason: {record['reason']}")
+            lines.append("Entry:")
+            lines.append(record["entry_text"])
+            lines.append("")
+    with open(unresolved_log_path, "w", encoding="utf-8") as handle:
+        handle.write("\n".join(lines).rstrip() + "\n")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Check and fix BibTeX entries by looking up references online."
@@ -1131,6 +1388,24 @@ def main():
         "--output",
         default="project_description/biblio_checked.bib",
         help="Path to the output BibTeX file.",
+    )
+    parser.add_argument(
+        "--retry-unresolved",
+        default=None,
+        help=(
+            "Path to a BibTeX file containing only unresolved entries from a previous "
+            "run. When set, only those keys are rechecked and merged into --output."
+        ),
+    )
+    parser.add_argument(
+        "--unresolved-output",
+        default="unresolved-bib-entries.bib",
+        help="Path to write the BibTeX subset of still-unresolved entries.",
+    )
+    parser.add_argument(
+        "--unresolved-log",
+        default="unresolved-bib-entries.log",
+        help="Path to write the human-readable log for still-unresolved entries.",
     )
     parser.add_argument(
         "--mailto",
@@ -1173,29 +1448,71 @@ def main():
         default=None,
         help="Optional limit on number of entries to process.",
     )
+    parser.add_argument(
+        "--http-timeout",
+        type=float,
+        default=30.0,
+        help="HTTP timeout in seconds for each metadata lookup request.",
+    )
+    parser.add_argument(
+        "--http-retries",
+        type=int,
+        default=4,
+        help="Number of retries for transient HTTP errors such as 429 and 503.",
+    )
+    parser.add_argument(
+        "--retry-backoff",
+        type=float,
+        default=3.0,
+        help="Base backoff in seconds for transient HTTP retries.",
+    )
     args = parser.parse_args()
 
-    with open(args.input, "r", encoding="utf-8") as handle:
-        content = handle.read()
+    if args.http_timeout <= 0:
+        parser.error("--http-timeout must be positive")
+    if args.http_retries < 0:
+        parser.error("--http-retries must be non-negative")
+    if args.retry_backoff <= 0:
+        parser.error("--retry-backoff must be positive")
 
-    entries = split_entries(content)
+    global DEFAULT_HTTP_TIMEOUT, DEFAULT_HTTP_RETRIES, DEFAULT_HTTP_RETRY_BACKOFF
+    DEFAULT_HTTP_TIMEOUT = args.http_timeout
+    DEFAULT_HTTP_RETRIES = args.http_retries
+    DEFAULT_HTTP_RETRY_BACKOFF = args.retry_backoff
+
+    entries = load_bib_entries(args.input)
     if not entries:
         print(f"No BibTeX entries found in {args.input}", file=sys.stderr)
         sys.exit(1)
+
+    retry_targets = None
+    if args.retry_unresolved:
+        retry_targets, retry_load_errors = load_retry_targets(args.retry_unresolved)
+    else:
+        retry_load_errors = []
 
     output_entries = []
     updated = []
     unchanged = []
     unresolved = []
+    unresolved_records = []
     errors = []
+    checked_entries = 0
+    seen_retry_keys = set()
 
     for idx, entry_text in enumerate(entries):
-        if args.limit is not None and idx >= args.limit:
+        entry_type, key, fields = parse_entry(entry_text)
+        if retry_targets is not None and key not in retry_targets:
             output_entries.append(entry_text)
             continue
-        entry_type, key, fields = parse_entry(entry_text)
+        if args.limit is not None and checked_entries >= args.limit:
+            output_entries.append(entry_text)
+            continue
+        checked_entries += 1
         display_key = key or f"entry_{idx + 1}"
         print(f"Checking {display_key}", flush=True)
+        if retry_targets is not None and key:
+            seen_retry_keys.add(key)
         if not key:
             errors.append((None, "could not parse entry key"))
             output_entries.append(entry_text)
@@ -1219,6 +1536,9 @@ def main():
         )
         if error:
             unresolved.append((key, error))
+            unresolved_records.append(
+                build_unresolved_record(key, entry_type, fields, error, entry_text)
+            )
             output_entries.append(entry_text)
             if (
                 error.startswith("no match")
@@ -1246,15 +1566,45 @@ def main():
             print("Result: file unchanged", flush=True)
         output_entries.append(format_entry(candidate_type, key, merged_fields))
 
+    if retry_targets is not None:
+        missing_retry_keys = sorted(set(retry_targets.keys()) - seen_retry_keys)
+        for key in missing_retry_keys:
+            reason = f"entry key not found in input during retry: {key}"
+            unresolved.append((key, reason))
+            unresolved_records.append(
+                build_unresolved_record(
+                    key,
+                    retry_targets[key].get("entry_type"),
+                    {},
+                    reason,
+                    retry_targets[key]["entry_text"],
+                )
+            )
+            errors.append((key, reason))
+
+    errors.extend(retry_load_errors)
+
     output_text = "\n\n".join(output_entries).strip() + "\n"
     with open(args.output, "w", encoding="ascii") as handle:
         handle.write(output_text)
 
+    write_unresolved_outputs(
+        args.unresolved_output,
+        args.unresolved_log,
+        unresolved_records,
+        args.input,
+        checked_entries,
+        retry_source=args.retry_unresolved,
+    )
+
     print(f"Total entries: {len(entries)}")
+    print(f"Checked entries: {checked_entries}")
     print(f"Updated: {len(updated)}")
     print(f"Unchanged: {len(unchanged)}")
     print(f"Unresolved: {len(unresolved)}")
     print(f"Errors: {len(errors)}")
+    print(f"Unresolved BibTeX: {os.path.abspath(args.unresolved_output)}")
+    print(f"Unresolved log: {os.path.abspath(args.unresolved_log)}")
     if updated:
         print("\nUpdated entries:")
         for key, fields in updated:
